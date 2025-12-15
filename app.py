@@ -15,6 +15,11 @@ st.set_page_config(page_title="資產管理系統)", layout="wide", page_icon="�
 DB_FILE = "investment_data_final.db"
 INTEREST_RATE_MARGIN = 0.0625
 RISK_FREE_RATE = 0.015
+TAX_RATE = 0.003       # 交易稅 0.3%
+TAX_RATE_ETF = 0.001   # ETF 交易稅 0.1%
+FEE_RATE = 0.001425    # 手續費牌告
+FEE_DISCOUNT = 0.6     # 券商折數
+MIN_FEE = 20           # 最低手續費
 
 # --- [Optimization] Session State for Cache Control ---
 if 'db_updated' not in st.session_state:
@@ -174,26 +179,40 @@ def calculate_current_holdings(df):
         if sym not in holdings_map: 
             holdings_map[sym] = {'qty': 0, 'loan': 0, 'short_qty': 0, 'short_deposit': 0, 'short_collateral': 0}
         
+        h = holdings_map[sym] # 建立引用縮寫，方便操作
+        
         if row['trans_type'] == 'Buy':
-            if row['mode'] == 'Short': # Cover
-                holdings_map[sym]['short_qty'] -= row['qty']
-                if holdings_map[sym]['short_qty'] <= 0:
-                    holdings_map[sym]['short_deposit'] = 0
-                    holdings_map[sym]['short_collateral'] = 0
-            else: # Buy Long
-                holdings_map[sym]['qty'] += row['qty']
-                holdings_map[sym]['loan'] += row['loan_amount']
+            if row['mode'] == 'Short': # Cover (融券回補)
+                if h['short_qty'] > 0:
+                    # [修正] 依比例扣除保證金與擔保品
+                    ratio = row['qty'] / h['short_qty']
+                    # 防止浮點數誤差導致大於 1
+                    ratio = min(1.0, ratio) 
+                    
+                    h['short_deposit'] -= (h['short_deposit'] * ratio)
+                    h['short_collateral'] -= (h['short_collateral'] * ratio)
+                    h['short_qty'] -= row['qty']
+            else: # Buy Long (現股/融資買進)
+                h['qty'] += row['qty']
+                h['loan'] += row['loan_amount']
+
         else: # Sell
-            if row['mode'] == 'Short': # Short Open
-                holdings_map[sym]['short_qty'] += row['qty']
-                holdings_map[sym]['short_deposit'] += row['loan_amount']
-                holdings_map[sym]['short_collateral'] += (row['price'] * row['qty'])
-            else: # Sell Long
-                holdings_map[sym]['qty'] -= row['qty']
-                holdings_map[sym]['loan'] -= row['loan_amount']
+            if row['mode'] == 'Short': # Short Open (融券賣出)
+                h['short_qty'] += row['qty']
+                h['short_deposit'] += row['loan_amount']
+                h['short_collateral'] += (row['price'] * row['qty'])
+            else: # Sell Long (現股/融資賣出)
+                if h['qty'] > 0:
+                    # [修正] 依比例扣除融資借款
+                    ratio = row['qty'] / h['qty']
+                    ratio = min(1.0, ratio)
+                    
+                    h['loan'] -= (h['loan'] * ratio)
+                    h['qty'] -= row['qty']
 
     # Filter active symbols
-    active_syms = [k for k, v in holdings_map.items() if v['qty'] > 0 or v['short_qty'] > 0]
+    # 加上 round 避免浮點數殘留 (例如 0.0000001 股)
+    active_syms = [k for k, v in holdings_map.items() if round(v['qty'], 2) > 0 or round(v['short_qty'], 2) > 0]
     return active_syms, holdings_map, symbol_name_map
 
 def recalculate_history():
@@ -415,6 +434,7 @@ def calculate_portfolio_metrics(df, current_holdings):
     enriched_holdings = []
     total_mkt_val = 0
     total_own_funds = 0 
+    today_date = date.today()
     
     df_sorted = df.sort_values(['date', 'id'])
     trans_group = df_sorted.groupby('symbol')
@@ -433,37 +453,40 @@ def calculate_portfolio_metrics(df, current_holdings):
         acc_own_funds = 0       # 累計自備款 (算 ROI 用)
         acc_loan_repay = 0      # 累計需還款 (算 淨值 用)
         acc_full_basis = 0      # 累計全額成本 (顯示 平均成本 用)
+        acc_interest = 0
         
         # === 邏輯 A: 做多部位 (現股 + 融資) ===
         if item['type'] == 'Long':
-            sells = sym_trans[(sym_trans['trans_type'] == 'Sell') & (sym_trans['mode'] != 'Short')]
+            sells = sym_trans[
+                (sym_trans['trans_type'] == 'Sell') & 
+                (sym_trans['mode'] != 'Short') & 
+                (sym_trans['mode'] != 'Day Trade')  # <--- 新增這行
+            ]
             total_sold_qty = sells['qty'].sum()
             
-            buys = sym_trans[(sym_trans['trans_type'] == 'Buy') & (sym_trans['mode'] != 'Short')]
-            
+            buys = sym_trans[
+                (sym_trans['trans_type'] == 'Buy') & 
+                (sym_trans['mode'] != 'Short') & 
+                (sym_trans['mode'] != 'Day Trade')  # <--- 新增這行
+            ]
             temp_sold_allowance = total_sold_qty
             needed_qty = qty_held
             
             for _, row in buys.iterrows():
                 buy_qty = row['qty']
                 
-                # A. 計算自備款與負債 (財務視角)
-                # 修改點：使用 'in' 來判斷，避免因資料庫存入 "Margin (融資)" 或有空白而判斷失敗
                 mode_str = str(row['mode']) 
                 
                 if 'Margin' in mode_str: 
                     # --- 融資模式 ---
-                    # 成本 = 自備款 (資料庫 cash_flow 絕對值)
                     lot_own_funds = abs(row['cash_flow'])
                     lot_loan = row['loan_amount']
                 else: 
                     # --- 現股模式 ---
-                    # 成本 = 全額股價 + 手續費
                     lot_own_funds = (row['price'] * row['qty']) + row['fee']
                     lot_loan = 0
                 
                 # B. 計算全額成本 (交易視角)
-                # 這行維持不變，用來顯示平均成本 $70.24
                 lot_full_cost = (row['price'] * row['qty']) + row['fee']
                 
                 if temp_sold_allowance >= buy_qty:
@@ -480,22 +503,46 @@ def calculate_portfolio_metrics(df, current_holdings):
                     acc_loan_repay += (lot_loan * ratio)
                     acc_full_basis += (lot_full_cost * ratio)
                     
+                    if lot_loan > 0:
+                        # 實際借款金額 (按比例)
+                        curr_loan_amt = lot_loan * ratio
+                        
+                        # 計算天數
+                        buy_date = datetime.strptime(row['date'], "%Y-%m-%d").date()
+                        days = (today_date - buy_date).days
+                        if days < 0: days = 0
+                        
+                        # 利息公式：本金 * 利率 * 天數 / 365
+                        interest = int(curr_loan_amt * INTEREST_RATE_MARGIN * days / 365)
+                        acc_interest += interest
+                        
                     needed_qty -= take_qty
                     if needed_qty <= 0:
                         break
             
             # --- 結算 ---
-            est_own_funds = acc_own_funds
-            net_equity = mkt_val - acc_loan_repay # 淨值 = 市值 - 負債
-            unrealized_pl = net_equity - est_own_funds # 損益 = 淨值 - 本金
+            curr_tax_rate = TAX_RATE_ETF if sym.startswith('00') else TAX_RATE
+            est_sell_fee = max(MIN_FEE, int(mkt_val * FEE_RATE * FEE_DISCOUNT))
+            est_sell_tax = int(mkt_val * curr_tax_rate)
             
-            # 算出顯示用的平均單價 (全額)
+            # 淨值 = 市值 - 賣出費 - 賣出稅 - 償還本金 - [新增]累積利息
+            net_equity = mkt_val - est_sell_fee - est_sell_tax - acc_loan_repay - acc_interest
+            
+            unrealized_pl = net_equity - acc_own_funds
             display_avg_price = acc_full_basis / qty_held if qty_held > 0 else 0
-            
+            est_own_funds = acc_own_funds
         # === 邏輯 B: 做空部位 (融券) ===
         else: # Short
-            short_sells = sym_trans[(sym_trans['trans_type'] == 'Sell') & (sym_trans['mode'] == 'Short')]
-            covers = sym_trans[(sym_trans['trans_type'] == 'Buy') & (sym_trans['mode'] == 'Short')]
+            short_sells = sym_trans[
+                (sym_trans['trans_type'] == 'Sell') & 
+                (sym_trans['mode'] == 'Short') & 
+                (sym_trans['mode'] != 'Day Trade') # <--- 安全起見加上
+            ]
+            covers = sym_trans[
+                (sym_trans['trans_type'] == 'Buy') & 
+                (sym_trans['mode'] == 'Short') & 
+                (sym_trans['mode'] != 'Day Trade') # <--- 安全起見加上
+            ]
             total_covered_qty = covers['qty'].sum()
             
             temp_covered_allowance = total_covered_qty
@@ -989,7 +1036,7 @@ def main():
 
                 m1, m2, m3 = st.columns(3)
 
-                m1.metric("總持倉市值", f"${total_own_funds:,.0f}")
+                m1.metric("總持倉成本", f"${total_own_funds:,.0f}")
 
                 pl_color = "normal" if total_pl >= 0 else "inverse"
 
