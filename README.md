@@ -12,11 +12,11 @@
 在終端機 (Terminal) 執行以下指令安裝依賴庫：
 ```bash
 pip install streamlit yfinance pandas plotly
-
+'''
 ## 2. 啟動系統
 ```bash
 streamlit run app.py
-
+'''
 📖 使用指南 (User Guide)
 --------------------
  
