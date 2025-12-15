@@ -168,7 +168,7 @@ def fetch_current_prices(symbols):
 
 @st.cache_data
 def calculate_current_holdings(df):
-    if df.empty: return [], {}, 0, 0, 0
+    if df.empty: return [], {}, {}
     
     symbol_name_map = df.groupby('symbol')['stock_name'].last().to_dict()
     holdings_map = {}
