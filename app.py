@@ -7,6 +7,8 @@ from datetime import datetime, date, timedelta
 import math
 import plotly.graph_objects as go
 import time
+import requests
+import re
 
 # --- 設定頁面 ---
 st.set_page_config(page_title="資產管理系統)", layout="wide", page_icon="📈")
@@ -17,6 +19,7 @@ INTEREST_RATE_MARGIN = 0.0625
 RISK_FREE_RATE = 0.015
 TAX_RATE = 0.003       # 交易稅 0.3%
 TAX_RATE_ETF = 0.001   # ETF 交易稅 0.1%
+TAX_RATE_WARRANT = 0.001  # 權證交易稅 0.1%
 FEE_RATE = 0.001425    # 手續費牌告
 FEE_DISCOUNT = 0.6     # 券商折數
 MIN_FEE = 20           # 最低手續費
@@ -47,101 +50,236 @@ def init_db():
                   cost_basis REAL     
                   )''')
     c.execute('''CREATE TABLE IF NOT EXISTS price_history
-                 (symbol TEXT, 
-                  date TEXT, 
+                 (symbol TEXT,
+                  date TEXT,
                   close REAL,
                   PRIMARY KEY (symbol, date))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS futures_trades (
+                  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                  date          TEXT,
+                  symbol        TEXT,
+                  name          TEXT,
+                  trade_type    TEXT,
+                  direction     TEXT,
+                  contracts     INTEGER,
+                  price         REAL,
+                  multiplier    REAL,
+                  fee           REAL,
+                  margin        REAL,
+                  settlement_pl REAL DEFAULT 0,
+                  realized_pl   REAL DEFAULT 0
+                 )''')
     conn.commit()
     conn.close()
 
 def sync_price_history(symbols):
     if not symbols: return
     
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        
-        today = date.today()
-        
-        for sym in symbols:
-            c.execute("SELECT MAX(date) FROM price_history WHERE symbol = ?", (sym,))
-            result = c.fetchone()[0]
-            
-            start_date = None
-            if result:
-                last_date = datetime.strptime(result, "%Y-%m-%d").date()
-                if last_date >= today: 
-                    continue 
-                start_date = last_date + timedelta(days=1)
-            else:
-                start_date = date(2023, 1, 1) 
-
-            if start_date <= today:
-                print(f"📥 Updating {sym} from {start_date}...") # Debug info
-                try:
-                    # yfinance ensures we get the latest data
-                    df = yf.download(sym, start=start_date, end=today + timedelta(days=1), progress=False, threads=False)
-                    
-                    if not df.empty:
-                        # Prepare data for insertion
-                        data_to_insert = []
-                        for idx, row in df.iterrows():
-                            # Handle different yfinance return formats (Series vs DataFrame)
-                            val = row['Close'].iloc[0] if isinstance(row['Close'], pd.Series) else row['Close']
-                            d_str = idx.strftime('%Y-%m-%d')
-                            data_to_insert.append((sym, d_str, float(val)))
-                        
-                        # 3. Batch insert into SQLite
-                        c.executemany("INSERT OR IGNORE INTO price_history (symbol, date, close) VALUES (?, ?, ?)", data_to_insert)
-                        conn.commit()
-                except Exception as e:
-                    print(f"Error updating {sym}: {e}")
-
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
     
+    today = date.today()
+    
+    for sym in symbols:
+        c.execute("SELECT MAX(date) FROM price_history WHERE symbol = ?", (sym,))
+        result = c.fetchone()[0]
+        
+        start_date = None
+        if result:
+            last_date = datetime.strptime(result, "%Y-%m-%d").date()
+            if last_date >= today: 
+                continue 
+            start_date = last_date + timedelta(days=1)
+        else:
+            start_date = date(2023, 1, 1) 
+
+        if start_date <= today:
+            print(f"📥 Updating {sym} from {start_date}...") # Debug info
+            try:
+                # yfinance ensures we get the latest data
+                df = yf.download(sym, start=start_date, end=today + timedelta(days=1), progress=False, threads=False)
+                
+                if not df.empty:
+                    # Prepare data for insertion
+                    data_to_insert = []
+                    for idx, row in df.iterrows():
+                        # Handle different yfinance return formats (Series vs DataFrame)
+                        val = row['Close'].iloc[0] if isinstance(row['Close'], pd.Series) else row['Close']
+                        d_str = idx.strftime('%Y-%m-%d')
+                        data_to_insert.append((sym, d_str, float(val)))
+                    
+                    # 3. Batch insert into SQLite
+                    c.executemany("INSERT OR IGNORE INTO price_history (symbol, date, close) VALUES (?, ?, ?)", data_to_insert)
+                    conn.commit()
+            except Exception as e:
+                print(f"Error updating {sym}: {e}")
+
+    conn.close()
     
 def trigger_db_update():
     st.session_state.db_updated = time.time()
 
 # --- 寫入交易 ---
 def add_transaction(date_str, symbol, name, trans_type, mode, price, qty, fee, tax, loan, interest, calculated_pl=0, cost_basis=0):
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        
-        # --- 現金流計算 (Cash Flow) ---
-        raw_val = price * qty
-        cash_flow = 0
-        
-        if mode == "Spot" or mode == "Day Trade":
-            if trans_type == 'Buy':
-                cash_flow = -(raw_val + fee)
-            else:
-                cash_flow = raw_val - fee - tax
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # --- 現金流計算 (Cash Flow) ---
+    raw_val = price * qty
+    cash_flow = 0
+    
+    if mode in ("Spot", "Day Trade", "Call Warrant", "Put Warrant"):
+        if trans_type == 'Buy':
+            cash_flow = -(raw_val + fee)
+        else:
+            cash_flow = raw_val - fee - tax
 
-        elif mode == "Margin":
-            if trans_type == 'Buy':
-                own_funds = raw_val - loan
-                cash_flow = -(own_funds + fee)
-            else:
-                cash_flow = raw_val - loan - fee - tax - interest
+    elif mode == "Margin":
+        if trans_type == 'Buy':
+            own_funds = raw_val - loan
+            cash_flow = -(own_funds + fee)
+        else:
+            cash_flow = raw_val - loan - fee - tax - interest
 
-        elif mode == "Short":
-            if trans_type == 'Sell': 
-                margin_deposit = loan 
-                cash_flow = -(margin_deposit + fee + tax)
-            else: 
-                total_refund = loan 
-                buy_cost = raw_val + fee
-                cash_flow = total_refund - buy_cost
+    elif mode == "Short":
+        if trans_type == 'Sell': 
+            margin_deposit = loan 
+            cash_flow = -(margin_deposit + fee + tax)
+        else: 
+            total_refund = loan 
+            buy_cost = raw_val + fee
+            cash_flow = total_refund - buy_cost
 
-        c.execute("""
-            INSERT INTO transactions 
-            (date, symbol, stock_name, trans_type, mode, price, qty, fee, tax, loan_amount, interest, cash_flow, realized_pl, cost_basis) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (date_str, symbol, name, trans_type, mode, price, qty, fee, tax, loan, interest, cash_flow, calculated_pl, cost_basis))
-        conn.commit()
-     
+    c.execute("""
+        INSERT INTO transactions 
+        (date, symbol, stock_name, trans_type, mode, price, qty, fee, tax, loan_amount, interest, cash_flow, realized_pl, cost_basis) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (date_str, symbol, name, trans_type, mode, price, qty, fee, tax, loan, interest, cash_flow, calculated_pl, cost_basis))
+    conn.commit()
+    conn.close()
+    
     
     trigger_db_update()
 
+
+# --- 期貨相關函式 ---
+def add_futures_open(date_str, symbol, name, direction, contracts, price, multiplier, fee, margin):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT INTO futures_trades (date, symbol, name, trade_type, direction, contracts, price, multiplier, fee, margin)
+        VALUES (?, ?, ?, 'Open', ?, ?, ?, ?, ?, ?)
+    """, (date_str, symbol, name, direction, contracts, price, multiplier, fee, margin))
+    conn.commit()
+    conn.close()
+    trigger_db_update()
+
+def add_futures_settlement(date_str, symbol, name, settlement_pl):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT INTO futures_trades (date, symbol, name, trade_type, settlement_pl)
+        VALUES (?, ?, ?, 'Settlement', ?)
+    """, (date_str, symbol, name, settlement_pl))
+    conn.commit()
+    conn.close()
+    trigger_db_update()
+
+def add_futures_close(date_str, symbol, name, contracts, close_price, fee):
+    """FIFO 平倉：找最早的開倉部位計算損益"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    # 取得所有 Open 記錄，按 id (時間) 排序
+    c.execute("""SELECT id, direction, contracts, price, multiplier FROM futures_trades
+                 WHERE symbol=? AND trade_type='Open' ORDER BY id ASC""", (symbol,))
+    open_rows = c.fetchall()
+
+    # 取得已平倉口數
+    c.execute("""SELECT COALESCE(SUM(contracts),0) FROM futures_trades
+                 WHERE symbol=? AND trade_type='Close'""", (symbol,))
+    already_closed = c.fetchone()[0] or 0
+
+    qty_to_close = contracts
+    realized = 0.0
+    matched_direction = 'Long'
+    matched_multiplier = 200.0
+
+    for row in open_rows:
+        oid, direction, open_contracts, open_price, multiplier = row
+        if already_closed >= open_contracts:
+            already_closed -= open_contracts
+            continue
+        available = open_contracts - already_closed
+        already_closed = 0
+        matched = min(available, qty_to_close)
+        matched_direction = direction
+        matched_multiplier = multiplier
+        direction_sign = 1 if direction == 'Long' else -1
+        realized += direction_sign * (close_price - open_price) * multiplier * matched
+        qty_to_close -= matched
+        if qty_to_close <= 0:
+            break
+
+    realized -= fee  # 扣手續費
+
+    # 累積結算損益 (該 symbol 所有 Settlement)
+    c.execute("""SELECT COALESCE(SUM(settlement_pl),0) FROM futures_trades
+                 WHERE symbol=? AND trade_type='Settlement'""", (symbol,))
+    acc_settlement = c.fetchone()[0] or 0
+
+    c.execute("""
+        INSERT INTO futures_trades (date, symbol, name, trade_type, direction, contracts, price, multiplier, fee, realized_pl)
+        VALUES (?, ?, ?, 'Close', ?, ?, ?, ?, ?, ?)
+    """, (date_str, symbol, name, 'Close', matched_direction, contracts, close_price, matched_multiplier, fee, int(realized)))
+    conn.commit()
+    conn.close()
+    trigger_db_update()
+
+@st.cache_data
+def get_futures_open_positions(last_update_time):
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM futures_trades ORDER BY id ASC", conn)
+    conn.close()
+    if df.empty:
+        return []
+
+    result = []
+    symbols = df['symbol'].unique()
+    for sym in symbols:
+        sym_df = df[df['symbol'] == sym]
+        opens = sym_df[sym_df['trade_type'] == 'Open']
+        closes = sym_df[sym_df['trade_type'] == 'Close']
+        settlements = sym_df[sym_df['trade_type'] == 'Settlement']
+
+        total_open = opens['contracts'].sum()
+        total_closed = closes['contracts'].sum()
+        remaining = total_open - total_closed
+        if remaining <= 0:
+            continue
+
+        # 最早的開倉為代表
+        first_open = opens.iloc[0]
+        acc_settlement = settlements['settlement_pl'].sum()
+        result.append({
+            'symbol': sym,
+            'name': first_open['name'],
+            'direction': first_open['direction'],
+            'open_contracts': int(remaining),
+            'open_price': first_open['price'],
+            'multiplier': first_open['multiplier'],
+            'margin': opens['margin'].sum(),
+            'acc_settlement': acc_settlement
+        })
+    return result
+
+@st.cache_data
+def get_futures_closed_trades(last_update_time):
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query(
+        "SELECT * FROM futures_trades WHERE trade_type='Close' ORDER BY date DESC",
+        conn
+    )
+    conn.close()
+    return df
 
 @st.cache_data
 def get_transactions(last_update_time):
@@ -150,20 +288,42 @@ def get_transactions(last_update_time):
     conn.close()
     return df
 
+def _fetch_tw_price_html(symbol):
+    """Scrape price from tw.stock.yahoo.com (fallback for warrants & others yfinance can't handle)."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        url = f'https://tw.stock.yahoo.com/quote/{symbol}'
+        r = requests.get(url, headers=headers, timeout=8)
+        m = re.search(r'"regularMarketPrice"[:\s]+([0-9.]+)', r.text)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(ttl=3600)
 def fetch_current_prices(symbols):
     if not symbols: return {}
+    prices = {}
+    # Step 1: batch fetch via yfinance
     try:
         tickers = yf.Tickers(" ".join(symbols))
-        prices = {}
         for sym in symbols:
             try:
-                prices[sym] = tickers.tickers[sym].fast_info.last_price
-            except:
+                p = tickers.tickers[sym].fast_info.last_price
+                prices[sym] = p if p else 0
+            except Exception:
                 prices[sym] = 0
-        return prices
-    except:
-        return {}
+    except Exception:
+        prices = {sym: 0 for sym in symbols}
+
+    # Step 2: fallback to HTML scrape for any symbol that returned 0
+    for sym in symbols:
+        if not prices.get(sym):
+            p = _fetch_tw_price_html(sym)
+            if p:
+                prices[sym] = p
+    return prices
 
 @st.cache_data
 def calculate_current_holdings(df):
@@ -178,50 +338,40 @@ def calculate_current_holdings(df):
         if sym not in holdings_map: 
             holdings_map[sym] = {'qty': 0, 'loan': 0, 'short_qty': 0, 'short_deposit': 0, 'short_collateral': 0}
         
-        h = holdings_map[sym]
-        
-        
-        qty = float(row['qty'])
-        loan = float(row['loan_amount'])
-        price = float(row['price'])
+        h = holdings_map[sym] # 建立引用縮寫，方便操作
         
         if row['trans_type'] == 'Buy':
             if row['mode'] == 'Short': # Cover (融券回補)
                 if h['short_qty'] > 0:
-                    ratio = qty / h['short_qty'] if h['short_qty'] > 0 else 0
+                    # [修正] 依比例扣除保證金與擔保品
+                    ratio = row['qty'] / h['short_qty']
+                    # 防止浮點數誤差導致大於 1
                     ratio = min(1.0, ratio) 
                     
                     h['short_deposit'] -= (h['short_deposit'] * ratio)
                     h['short_collateral'] -= (h['short_collateral'] * ratio)
-                    h['short_qty'] -= qty
-            else: # Buy Long
-                h['qty'] += qty
-                h['loan'] += loan
+                    h['short_qty'] -= row['qty']
+            else: # Buy Long (現股/融資買進)
+                h['qty'] += row['qty']
+                h['loan'] += row['loan_amount']
 
         else: # Sell
-            if row['mode'] == 'Short': # Short Open
-                h['short_qty'] += qty
-                h['short_deposit'] += loan
-                h['short_collateral'] += (price * qty)
-            else: # Sell Long
+            if row['mode'] == 'Short': # Short Open (融券賣出)
+                h['short_qty'] += row['qty']
+                h['short_deposit'] += row['loan_amount']
+                h['short_collateral'] += (row['price'] * row['qty'])
+            else: # Sell Long (現股/融資賣出)
                 if h['qty'] > 0:
-                    # [修正 2]：分母保護
-                    ratio = qty / h['qty'] if h['qty'] > 0 else 0
+                    # [修正] 依比例扣除融資借款
+                    ratio = row['qty'] / h['qty']
                     ratio = min(1.0, ratio)
                     
                     h['loan'] -= (h['loan'] * ratio)
-                    h['qty'] -= qty
+                    h['qty'] -= row['qty']
 
-    active_syms = []
-    for sym, data in holdings_map.items():
-        data['qty'] = round(data['qty'], 2)
-        data['short_qty'] = round(data['short_qty'], 2)
-        data['loan'] = round(data['loan'], 0) # 金額取整數
-        
-        # 只有當股數真的 > 0 才視為持倉
-        if data['qty'] > 0 or data['short_qty'] > 0:
-            active_syms.append(sym)
-            
+    # Filter active symbols
+    # 加上 round 避免浮點數殘留 (例如 0.0000001 股)
+    active_syms = [k for k, v in holdings_map.items() if round(v['qty'], 2) > 0 or round(v['short_qty'], 2) > 0]
     return active_syms, holdings_map, symbol_name_map
 
 def recalculate_history():
@@ -229,139 +379,143 @@ def recalculate_history():
     核心功能：重新計算所有歷史損益 (Replay All Transactions)
     解決補登舊資料導致 FIFO 順序錯誤的問題。
     """
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        
-        
-        c.execute("SELECT * FROM transactions ORDER BY date ASC, id ASC")
-        rows = c.fetchall()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    
+    c.execute("SELECT * FROM transactions ORDER BY date ASC, id ASC")
+    rows = c.fetchall()
 
-        inventory = {}
+    inventory = {}
+    
+    
+    updates = []
+    
+    for r in rows:
+        r_id, r_date, sym, name, t_type, mode, price, qty, fee, tax, loan, interest, cash, pl, cost = r
         
+        # 確保字典結構存在
+        if sym not in inventory: inventory[sym] = {}
+        if mode not in inventory[sym]: inventory[sym][mode] = []
         
-        updates = []
+        current_date = datetime.strptime(r_date, "%Y-%m-%d").date()
         
-        for r in rows:
-            r_id, r_date, sym, name, t_type, mode, price, qty, fee, tax, loan, interest, cash, pl, cost = r
+        # --- CASE A: 建立部位 (買進現股/融資，或 賣出融券) ---
+        is_opening = (t_type == 'Buy' and mode != 'Short') or (t_type == 'Sell' and mode == 'Short')
+        
+        if is_opening:
+            lot = {
+                'id': r_id,
+                'date': current_date,
+                'qty': qty,
+                'price': price,
+                'loan': loan,
+                'fee': fee, 
+                'orig_cash_flow': abs(cash) 
+            }
+            inventory[sym][mode].append(lot)
+            updates.append((0, 0, interest, cash, r_id)) 
+
+
+        else:
+            qty_to_match = qty
             
-            # 確保字典結構存在
-            if sym not in inventory: inventory[sym] = {}
-            if mode not in inventory[sym]: inventory[sym][mode] = []
+            accumulated_cost = 0     
+            accumulated_interest = 0 
+            repaid_loan = 0           
             
-            current_date = datetime.strptime(r_date, "%Y-%m-%d").date()
-            
-            # --- CASE A: 建立部位 (買進現股/融資，或 賣出融券) ---
-            is_opening = (t_type == 'Buy' and mode != 'Short') or (t_type == 'Sell' and mode == 'Short')
-            
-            if is_opening:
-                lot = {
-                    'id': r_id,
-                    'date': current_date,
-                    'qty': qty,
-                    'price': price,
-                    'loan': loan,
-                    'fee': fee, 
-                    'orig_cash_flow': abs(cash) 
-                }
-                inventory[sym][mode].append(lot)
-                updates.append((0, 0, interest, cash, r_id)) 
-
-
-            else:
-                qty_to_match = qty
+            lots = inventory[sym][mode]
+            active_lots = [] 
+            for lot in lots:
+                if qty_to_match <= 0:
+                    active_lots.append(lot) # 已經扣完了，剩下的放回庫存
+                    continue
                 
-                accumulated_cost = 0     
-                accumulated_interest = 0 
-                repaid_loan = 0           
+                matched_qty = min(lot['qty'], qty_to_match)
                 
-                lots = inventory[sym][mode]
-                active_lots = [] 
-                for lot in lots:
-                    if qty_to_match <= 0:
-                        active_lots.append(lot) # 已經扣完了，剩下的放回庫存
-                        continue
-                    
-                    matched_qty = min(lot['qty'], qty_to_match)
-                    
-                    # 1. 計算比例成本
-                    
-                    if mode == 'Spot':
-                        # 現股成本 = (股價*股數 + 手續費)
-                        lot_total_cost = (lot['price'] * lot['qty']) + lot['fee']
-                        part_cost = (lot_total_cost / lot['qty']) * matched_qty
-                        accumulated_cost += part_cost
-                        
-                    elif mode == 'Margin':
-                        lot_total_basis = (lot['price'] * lot['qty']) + lot['fee']
-                        part_cost = (lot_total_basis / lot['qty']) * matched_qty
-                        accumulated_cost += part_cost
-                        
-                        part_loan = (lot['loan'] / lot['qty']) * matched_qty
-                        repaid_loan += part_loan
-                        
-                        days = (current_date - lot['date']).days
-                        if days < 0: days = 0
-                        # 融資利息
-                        interest_amt = part_loan * INTEREST_RATE_MARGIN * (days / 365)
-                        accumulated_interest += interest_amt
-
-                    elif mode == 'Short':
-                        part_loan = (lot['loan'] / lot['qty']) * matched_qty # 退回保證金
-                        repaid_loan += part_loan
-                        accumulated_interest += 0 
-
-                    qty_to_match -= matched_qty
-                    
-                    # 處理剩餘股數
-                    if lot['qty'] > matched_qty:
-                        lot['qty'] -= matched_qty
-                        remaining_ratio = lot['qty'] / (lot['qty'] + matched_qty)
-                        lot['loan'] *= remaining_ratio
-                        lot['fee'] *= remaining_ratio
-                        active_lots.append(lot)
+                # 1. 計算比例成本
                 
-                # 更新庫存
-                inventory[sym][mode] = active_lots
-                
-                # --- 結算這筆交易的最終數值 ---
-                final_interest = int(accumulated_interest)
-                final_cost_basis = int(accumulated_cost)
-                final_pl = 0
-                new_cash_flow = 0
-                
-                # A. 現股賣出
-                if mode == 'Spot':
-                    # 淨拿回 = (賣價*股數) - 費 - 稅
-                    net_proceeds = (price * qty) - fee - tax
-                    final_pl = net_proceeds - final_cost_basis
-                    new_cash_flow = net_proceeds # 現金流就是拿回多少錢
+                if mode in ('Spot', 'Call Warrant', 'Put Warrant'):
+                    # 現股/權證成本 = (股價*股數 + 手續費)
+                    lot_total_cost = (lot['price'] * lot['qty']) + lot['fee']
+                    part_cost = (lot_total_cost / lot['qty']) * matched_qty
+                    accumulated_cost += part_cost
                     
-                # B. 融資賣出
                 elif mode == 'Margin':
-                    gross_proceeds = (price * qty)
-                    new_cash_flow = gross_proceeds - fee - tax - repaid_loan - final_interest
-                    final_pl = (gross_proceeds - fee - tax - final_interest) - final_cost_basis
+                    lot_total_basis = (lot['price'] * lot['qty']) + lot['fee']
+                    part_cost = (lot_total_basis / lot['qty']) * matched_qty
+                    accumulated_cost += part_cost
+                    
+                    part_loan = (lot['loan'] / lot['qty']) * matched_qty
+                    repaid_loan += part_loan
+                    
+                    days = (current_date - lot['date']).days
+                    if days < 0: days = 0
+                    # 融資利息
+                    interest_amt = part_loan * INTEREST_RATE_MARGIN * (days / 365)
+                    accumulated_interest += interest_amt
 
-                # C. 融券回補
                 elif mode == 'Short':
-                    # 買回支出 = (買價*股數 + 費)
-                    buy_back_cost = (price * qty) + fee
-                    final_cost_basis = int(accumulated_cost) # 當初賣出的淨額
-                    final_pl = final_cost_basis - buy_back_cost
-                    new_cash_flow = repaid_loan + final_pl # 簡單推算：拿回的錢 = 保證金 + 賺的錢(或賠的錢)
+                    part_loan = (lot['loan'] / lot['qty']) * matched_qty # 退回保證金
+                    repaid_loan += part_loan
+                    accumulated_interest += 0 
 
-                updates.append((final_pl, final_cost_basis, final_interest, int(new_cash_flow), r_id))
+                qty_to_match -= matched_qty
+                
+                # 處理剩餘股數
+                if lot['qty'] > matched_qty:
+                    lot['qty'] -= matched_qty
+                    remaining_ratio = lot['qty'] / (lot['qty'] + matched_qty)
+                    lot['loan'] *= remaining_ratio
+                    lot['fee'] *= remaining_ratio
+                    active_lots.append(lot)
+            
+            # 更新庫存
+            inventory[sym][mode] = active_lots
+            
+            # --- 結算這筆交易的最終數值 ---
+            final_interest = int(accumulated_interest)
+            final_cost_basis = int(accumulated_cost)
+            final_pl = 0
+            new_cash_flow = 0
+            
+            # A. 現股/權證賣出
+            if mode in ('Spot', 'Call Warrant', 'Put Warrant'):
+                # 淨拿回 = (賣價*股數) - 費 - 稅
+                net_proceeds = (price * qty) - fee - tax
+                final_pl = net_proceeds - final_cost_basis
+                new_cash_flow = net_proceeds # 現金流就是拿回多少錢
+                
+            # B. 融資賣出
+            elif mode == 'Margin':
+                gross_proceeds = (price * qty)
+                new_cash_flow = gross_proceeds - fee - tax - repaid_loan - final_interest
+                final_pl = (gross_proceeds - fee - tax - final_interest) - final_cost_basis
 
-        # 3. 批次寫回資料庫
-        c.executemany("""
-            UPDATE transactions 
-            SET realized_pl=?, cost_basis=?, interest=?, cash_flow=? 
-            WHERE id=?
-        """, updates)
-        
-        conn.commit()
+            # C. 融券回補
+            elif mode == 'Short':
+                # 買回支出 = (買價*股數 + 費)
+                buy_back_cost = (price * qty) + fee
+                final_cost_basis = int(accumulated_cost) # 當初賣出的淨額
+                final_pl = final_cost_basis - buy_back_cost
+                new_cash_flow = repaid_loan + final_pl # 簡單推算：拿回的錢 = 保證金 + 賺的錢(或賠的錢)
+
+            updates.append((final_pl, final_cost_basis, final_interest, int(new_cash_flow), r_id))
+
+    # 3. 批次寫回資料庫
+    c.executemany("""
+        UPDATE transactions 
+        SET realized_pl=?, cost_basis=?, interest=?, cash_flow=? 
+        WHERE id=?
+    """, updates)
+    
+    conn.commit()
+    conn.close()
+    
+    # 記得更新外部 Cache 時間戳記
     trigger_db_update()
     
+# --- FIFO Logic (Unchanged but uses cached DF) ---
 def calculate_fifo_outcome(symbol, sell_qty, sell_price, sell_date_str, mode):
     # Pass the current timestamp to get the cached DF
     df = get_transactions(st.session_state.db_updated)
@@ -417,7 +571,7 @@ def calculate_fifo_outcome(symbol, sell_qty, sell_price, sell_date_str, mode):
             part_cost = (orig_cash_out / row['qty']) * matched
             total_cost_basis += part_cost
 
-        elif mode == 'Spot':
+        elif mode in ('Spot', 'Call Warrant', 'Put Warrant'):
             orig_invest = (row['price'] * row['qty']) + row['fee']
             part_cost = (orig_invest / row['qty']) * matched
             total_cost_basis += part_cost
@@ -428,16 +582,18 @@ def calculate_fifo_outcome(symbol, sell_qty, sell_price, sell_date_str, mode):
 
 @st.cache_data
 def calculate_portfolio_metrics(df, current_holdings):
-    if not current_holdings: return [], 0, 0
+    """
+    修正版 V3：
+    1. [P/L 與 ROI]：基於「自備款 (Own Funds)」計算，反映槓桿獲利能力。
+    2. [顯示用的平均成本]：基於「全額成交價 (Full Basis)」計算，反映原始股價位置。
+    """
+    if not current_holdings:
+        return [], 0, 0
         
     enriched_holdings = []
     total_mkt_val = 0
     total_own_funds = 0 
     today_date = date.today()
-    
-    # 預先處理好 dataframe，確保它是 datetime 物件 (加速運算)
-    df = df.copy()
-    df['date_dt'] = pd.to_datetime(df['date']).dt.date
     
     df_sorted = df.sort_values(['date', 'id'])
     trans_group = df_sorted.groupby('symbol')
@@ -452,36 +608,44 @@ def calculate_portfolio_metrics(df, current_holdings):
         else:
             sym_trans = pd.DataFrame()
 
-        acc_own_funds = 0      
-        acc_loan_repay = 0     
-        acc_full_basis = 0     
+        # 初始化兩組累計器
+        acc_own_funds = 0       # 累計自備款 (算 ROI 用)
+        acc_loan_repay = 0      # 累計需還款 (算 淨值 用)
+        acc_full_basis = 0      # 累計全額成本 (顯示 平均成本 用)
         acc_interest = 0
         
-        # === 邏輯 A: 做多部位 ===
+        # === 邏輯 A: 做多部位 (現股 + 融資) ===
         if item['type'] == 'Long':
-            # 篩選邏輯不變...
-            sells = sym_trans[(sym_trans['trans_type'] == 'Sell') & (sym_trans['mode'] != 'Short') & (sym_trans['mode'] != 'Day Trade')]
+            sells = sym_trans[
+                (sym_trans['trans_type'] == 'Sell') & 
+                (sym_trans['mode'] != 'Short') & 
+                (sym_trans['mode'] != 'Day Trade')  # <--- 新增這行
+            ]
             total_sold_qty = sells['qty'].sum()
             
-            buys = sym_trans[(sym_trans['trans_type'] == 'Buy') & (sym_trans['mode'] != 'Short') & (sym_trans['mode'] != 'Day Trade')]
-            
+            buys = sym_trans[
+                (sym_trans['trans_type'] == 'Buy') & 
+                (sym_trans['mode'] != 'Short') & 
+                (sym_trans['mode'] != 'Day Trade')  # <--- 新增這行
+            ]
             temp_sold_allowance = total_sold_qty
             needed_qty = qty_held
             
             for _, row in buys.iterrows():
                 buy_qty = row['qty']
-                # [修正 4]：遇到無效的 buy_qty (0) 直接跳過，防止除以零
-                if buy_qty <= 0: continue
-
-                # ... (取得 loan, own_funds 邏輯不變) ...
-                mode_str = str(row['mode'])
-                if 'Margin' in mode_str:
+                
+                mode_str = str(row['mode']) 
+                
+                if 'Margin' in mode_str: 
+                    # --- 融資模式 ---
                     lot_own_funds = abs(row['cash_flow'])
                     lot_loan = row['loan_amount']
-                else:
+                else: 
+                    # --- 現股模式 ---
                     lot_own_funds = (row['price'] * row['qty']) + row['fee']
                     lot_loan = 0
                 
+                # B. 計算全額成本 (交易視角)
                 lot_full_cost = (row['price'] * row['qty']) + row['fee']
                 
                 if temp_sold_allowance >= buy_qty:
@@ -492,43 +656,54 @@ def calculate_portfolio_metrics(df, current_holdings):
                     temp_sold_allowance = 0 
                     
                     take_qty = min(remaining_in_lot, needed_qty)
-                    
-                    # [修正 5]：分母保護 (雖然上面 check 過 <=0，但雙重保險)
-                    ratio = take_qty / buy_qty if buy_qty > 0 else 0
+                    ratio = take_qty / buy_qty
                     
                     acc_own_funds += (lot_own_funds * ratio)
                     acc_loan_repay += (lot_loan * ratio)
                     acc_full_basis += (lot_full_cost * ratio)
                     
                     if lot_loan > 0:
+                        # 實際借款金額 (按比例)
                         curr_loan_amt = lot_loan * ratio
-                        days = (today_date - row['date_dt']).days # 改用預處理好的 date_dt
+                        
+                        # 計算天數
+                        buy_date = datetime.strptime(row['date'], "%Y-%m-%d").date()
+                        days = (today_date - buy_date).days
                         if days < 0: days = 0
+                        
+                        # 利息公式：本金 * 利率 * 天數 / 365
                         interest = int(curr_loan_amt * INTEREST_RATE_MARGIN * days / 365)
                         acc_interest += interest
                         
                     needed_qty -= take_qty
-                    if needed_qty <= 0: break
+                    if needed_qty <= 0:
+                        break
             
             # --- 結算 ---
             curr_tax_rate = TAX_RATE_ETF if sym.startswith('00') else TAX_RATE
             est_sell_fee = max(MIN_FEE, int(mkt_val * FEE_RATE * FEE_DISCOUNT))
             est_sell_tax = int(mkt_val * curr_tax_rate)
             
+            # 淨值 = 市值 - 賣出費 - 賣出稅 - 償還本金 - [新增]累積利息
             net_equity = mkt_val - est_sell_fee - est_sell_tax - acc_loan_repay - acc_interest
-            unrealized_pl = net_equity - acc_own_funds
             
-            # [修正 6]：分母保護
+            unrealized_pl = net_equity - acc_own_funds
             display_avg_price = acc_full_basis / qty_held if qty_held > 0 else 0
             est_own_funds = acc_own_funds
-
-        # === 邏輯 B: 做空部位 (概念同上，需加分母保護) ===
+        # === 邏輯 B: 做空部位 (融券) ===
         else: # Short
-            # ... (篩選邏輯不變) ...
-            short_sells = sym_trans[(sym_trans['trans_type'] == 'Sell') & (sym_trans['mode'] == 'Short') & (sym_trans['mode'] != 'Day Trade')]
-            covers = sym_trans[(sym_trans['trans_type'] == 'Buy') & (sym_trans['mode'] == 'Short') & (sym_trans['mode'] != 'Day Trade')]
-            
+            short_sells = sym_trans[
+                (sym_trans['trans_type'] == 'Sell') & 
+                (sym_trans['mode'] == 'Short') & 
+                (sym_trans['mode'] != 'Day Trade') # <--- 安全起見加上
+            ]
+            covers = sym_trans[
+                (sym_trans['trans_type'] == 'Buy') & 
+                (sym_trans['mode'] == 'Short') & 
+                (sym_trans['mode'] != 'Day Trade') # <--- 安全起見加上
+            ]
             total_covered_qty = covers['qty'].sum()
+            
             temp_covered_allowance = total_covered_qty
             needed_qty = qty_held
             
@@ -537,9 +712,12 @@ def calculate_portfolio_metrics(df, current_holdings):
             
             for _, row in short_sells.iterrows():
                 sell_qty = row['qty']
-                if sell_qty <= 0: continue # 保護
-
-                lot_deposit = abs(row['cash_flow'])
+                
+                # 財務視角
+                lot_deposit = abs(row['cash_flow']) # 保證金
+                
+                # 交易視角 (當初賣出的全額價值)
+                # 用這來看平均賣出價格
                 lot_sell_val = row['price'] * row['qty'] 
                 
                 if temp_covered_allowance >= sell_qty:
@@ -550,34 +728,33 @@ def calculate_portfolio_metrics(df, current_holdings):
                     temp_covered_allowance = 0
                     
                     take_qty = min(remaining_in_lot, needed_qty)
-                    # [修正 7]：分母保護
-                    ratio = take_qty / sell_qty if sell_qty > 0 else 0
+                    ratio = take_qty / sell_qty
                     
                     acc_deposit += (lot_deposit * ratio)
                     acc_collateral += (lot_sell_val * ratio)
                     
                     needed_qty -= take_qty
-                    if needed_qty <= 0: break
+                    if needed_qty <= 0:
+                        break
             
             est_own_funds = acc_deposit
-            unrealized_pl = acc_collateral - mkt_val 
-            # [修正 8]：分母保護
+            unrealized_pl = acc_collateral - mkt_val # (賣出價 - 現價)
             display_avg_price = acc_collateral / qty_held if qty_held > 0 else 0
 
-        # [修正 9]：ROI 分母保護
+        # ROI 分母使用「自備款」
         ret_pct = (unrealized_pl / est_own_funds) * 100 if est_own_funds > 0 else 0
+        
+        total_mkt_val += mkt_val
+        total_own_funds += est_own_funds
         
         new_item = item.copy()
         new_item.update({
-            'est_own_funds': est_own_funds, 
-            'avg_price_basis': display_avg_price, 
+            'est_own_funds': est_own_funds, # 藏在資料裡供計算用
+            'avg_price_basis': display_avg_price, # 這是給 UI 顯示用的「原始均價」
             'unrealized_pl': unrealized_pl,
             'return_pct': ret_pct
         })
         enriched_holdings.append(new_item)
-        
-        total_mkt_val += mkt_val
-        total_own_funds += est_own_funds
         
     return enriched_holdings, total_mkt_val, total_own_funds
     
@@ -786,13 +963,16 @@ def main():
             st.session_state.valid_name = input_name
             input_date = st.date_input("交易日期", date.today())
             
-            mode_opts = ["Spot (現股)", "Margin (融資)", "Short (融券)", "Day Trade (現股當沖)"]
+            mode_opts = ["Spot (現股)", "Margin (融資)", "Short (融券)", "Day Trade (現股當沖)",
+                         "Call Warrant (買進型權證)", "Put Warrant (賣出型權證)"]
             mode_raw = st.selectbox("模式", mode_opts)
-            
+
             mode = "Spot"
             if "Margin" in mode_raw: mode = "Margin"
             if "Short" in mode_raw: mode = "Short"
             if "Day Trade" in mode_raw: mode = "Day Trade"
+            if "Call Warrant" in mode_raw: mode = "Call Warrant"
+            if "Put Warrant" in mode_raw: mode = "Put Warrant"
 
             qty = st.number_input("股數", min_value=10, step=1000)
 
@@ -827,6 +1007,10 @@ def main():
                 profit_est = 0
                 cost_basis_est = 0
                 
+                if mode in ("Call Warrant", "Put Warrant"):
+                    warrant_label = "📈 買進型 (Call)" if mode == "Call Warrant" else "📉 賣出型 (Put)"
+                    st.info(f"{warrant_label}｜交易稅固定 0.1%")
+
                 if mode == "Margin" and t_type == "Buy":
                     st.info("設定融資成數")
                     ratio_val = st.slider("成數", 0.1, 0.9, 0.6, 0.1)
@@ -837,14 +1021,23 @@ def main():
                     st.warning("系統將依 FIFO 自動計算償還本金與利息")
                     if st.button("🔍 試算損益"):
                          loan_val, interest_est, cost_basis_est = calculate_fifo_outcome(st.session_state.valid_symbol, qty, price, input_date, mode)
-                         
+
                          fee_tmp = max(20, int(price*qty*FEE_RATE * FEE_DISCOUNT))
                          tax_tmp = int(price*qty*TAX_RATE)
                          profit_est = (price * qty) - fee_tmp - tax_tmp - loan_val - interest_est - cost_basis_est
-                         
+
                          st.write(f"償還本金: ${loan_val:,}")
                          st.write(f"利息: ${interest_est:,}")
                          st.metric("預估獲利", f"${profit_est:,.0f}", delta_color="normal")
+
+                elif mode in ("Call Warrant", "Put Warrant") and t_type == "Sell":
+                    if st.button("🔍 試算損益"):
+                        _, _, cost_basis_est = calculate_fifo_outcome(st.session_state.valid_symbol, qty, price, input_date, mode)
+                        fee_tmp = max(20, int(price * qty * FEE_RATE * FEE_DISCOUNT))
+                        tax_tmp = math.floor(price * qty * TAX_RATE_WARRANT)
+                        profit_est = (price * qty) - fee_tmp - tax_tmp - cost_basis_est
+                        st.write(f"成本: ${cost_basis_est:,}")
+                        st.metric("預估獲利", f"${profit_est:,.0f}", delta_color="normal")
 
                 elif mode == "Short" and t_type == "Sell":
                     ratio_val = st.slider("保證金成數", 0.1, 1.0, 0.9, 0.1)
@@ -855,7 +1048,12 @@ def main():
                 fee = max(20, raw_fee)
                 tax = 0
                 if t_type == 'Sell':
-                    rate = TAX_RATE_ETF if st.session_state.valid_symbol.startswith('00') else TAX_RATE
+                    if mode in ('Call Warrant', 'Put Warrant'):
+                        rate = TAX_RATE_WARRANT
+                    elif st.session_state.valid_symbol.startswith('00'):
+                        rate = TAX_RATE_ETF
+                    else:
+                        rate = TAX_RATE
                     tax = math.floor(price * qty * rate)
                 
                 st.markdown("---")
@@ -865,35 +1063,38 @@ def main():
 
             if st.button("確認交易", type="primary", width='stretch'):
                 
-                # [修正 13]：輸入驗證 (Input Validation)
-                # 1. 價格與股數必須大於 0
-                if mode != "Day Trade" and (price <= 0 or qty <= 0):
-                    st.error("❌ 錯誤：價格與股數必須大於 0")
-                    # 直接中斷，不執行後面程式碼
-                    return 
-
                 if mode == "Day Trade":
-                    if buy_price <= 0 or sell_price <= 0 or qty <= 0:
-                        st.error("❌ 錯誤：當沖買賣價格與股數皆須大於 0")
-                        return
+                    if buy_price <= 0 or sell_price <= 0:
+                        st.error("請輸入完整的買入與賣出價格")
                     else:
-                        # ... (原本當沖的邏輯保持不變) ...
-                        # ...
-                        st.toast("已完成當沖登錄！", icon="⚡") # 增加 Toast 提示
+                        fee_buy = max(20, int(buy_price * qty * FEE_RATE * FEE_DISCOUNT))
+                        add_transaction(input_date, st.session_state.valid_symbol, st.session_state.valid_name,
+                                        'Buy', 'Day Trade', buy_price, qty, fee_buy, 0, 
+                                        0, 0, 0, 0)
+                        
+                        fee_sell = max(20, int(sell_price * qty * FEE_RATE * FEE_DISCOUNT))
+                        tax_dt = int(sell_price * qty * TAX_RATE * 0.5)
+                        
+                        buy_cost_total = (buy_price * qty) + fee_buy
+                        sell_net_total = (sell_price * qty) - fee_sell - tax_dt
+                        realized_pl = sell_net_total - buy_cost_total
+                        
+                        add_transaction(input_date, st.session_state.valid_symbol, st.session_state.valid_name,
+                                        'Sell', 'Day Trade', sell_price, qty, fee_sell, tax_dt, 
+                                        0, 0, realized_pl, buy_cost_total)
+                        
+                        st.success("已完成當沖登錄！")
                         time.sleep(1) 
                         st.rerun()
 
-                else: # 非當沖模式
+                else:
                     realized_pl = 0
                     cost_basis = 0
                     final_loan_param = loan_val 
                     final_interest_param = 0
                     
                     if mode == 'Margin' and t_type == 'Sell':
-                        # [修正 14]：這裡可以傳入目前的 df 快取，雖然不傳也可以運作
-                        repay_loan, interest_calc, orig_invested = calculate_fifo_outcome(
-                            st.session_state.valid_symbol, qty, price, input_date, mode
-                        )
+                        repay_loan, interest_calc, orig_invested = calculate_fifo_outcome(st.session_state.valid_symbol, qty, price, input_date, mode)
                         
                         final_loan_param = repay_loan
                         final_interest_param = interest_calc
@@ -901,30 +1102,152 @@ def main():
                         realized_pl = current_net_cash - orig_invested
 
                     elif mode == 'Short' and t_type == 'Buy':
-                        refund_deposit, refund_collateral, orig_invested = calculate_fifo_outcome(
-                            st.session_state.valid_symbol, qty, price, input_date, mode
-                        )
+                        refund_deposit, refund_collateral, orig_invested = calculate_fifo_outcome(st.session_state.valid_symbol, qty, price, input_date, mode)
                         total_refund = refund_deposit + refund_collateral
                         cover_cost = (price * qty) + fee
                         current_net_cash = total_refund - cover_cost
                         final_loan_param = total_refund 
                         realized_pl = current_net_cash - orig_invested
                         
-                    elif mode == 'Spot' and t_type == 'Sell':
-                         _, _, orig_invested = calculate_fifo_outcome(
-                             st.session_state.valid_symbol, qty, price, input_date, mode
-                         )
+                    elif mode in ('Spot', 'Call Warrant', 'Put Warrant') and t_type == 'Sell':
+                         _, _, orig_invested = calculate_fifo_outcome(st.session_state.valid_symbol, qty, price, input_date, mode)
                          current_net_cash = (price * qty) - fee - tax
                          realized_pl = current_net_cash - orig_invested
 
                     add_transaction(input_date, st.session_state.valid_symbol, st.session_state.valid_name,
-                                    t_type, mode, price, qty, fee, tax, 
+                                    t_type, mode, price, qty, fee, tax,
                                     final_loan_param, final_interest_param, realized_pl, cost_basis)
-                    
-                    st.toast("✅ 交易已記錄！", icon="💾") # 增加 Toast 提示
-                    time.sleep(1) 
+                    st.success("已記錄！")
+                    time.sleep(1)
                     st.rerun()
-            
+
+        st.markdown("---")
+        st.header("🎫 權證登錄")
+        st.caption("權證代號無法透過 Yahoo 驗證，請手動輸入。")
+
+        w_date  = st.date_input("交易日期", date.today(), key="w_date")
+        w_sym   = st.text_input("權證代號 (如 03xxxx)", key="w_sym")
+        w_name  = st.text_input("名稱 (如 台積電買權)", key="w_name")
+        w_wtype = st.selectbox("權證類型", ["Call Warrant (買進型)", "Put Warrant (賣出型)"], key="w_type")
+        w_dir   = st.selectbox("方向", ["Buy", "Sell"], key="w_dir")
+        w_qty   = st.number_input("股數", min_value=1, step=1000, key="w_qty")
+        w_price = st.number_input("價格", min_value=0.0, step=0.01, format="%.2f", key="w_price")
+
+        # 即時費用試算
+        w_fee = max(20, math.floor(w_price * w_qty * FEE_RATE * FEE_DISCOUNT))
+        w_tax = math.floor(w_price * w_qty * TAX_RATE_WARRANT) if w_dir == "Sell" else 0
+        w_gross = w_price * w_qty
+
+        st.markdown("---")
+        wc1, wc2 = st.columns(2)
+        wc1.write(f"手續費: **{w_fee:,}**")
+        wc2.write(f"稅 (0.1%): **{w_tax:,}**")
+
+        if w_dir == "Buy":
+            w_total = w_gross + w_fee
+            st.metric("應付款", f"${w_total:,.0f}")
+        else:
+            w_total = w_gross - w_fee - w_tax
+            st.metric("應收款 (預估)", f"${w_total:,.0f}")
+
+        if st.button("確認權證交易", type="primary", key="w_submit", use_container_width=True):
+            if not w_sym.strip():
+                st.error("請輸入權證代號")
+            elif w_price <= 0:
+                st.error("請輸入價格")
+            else:
+                w_mode = "Call Warrant" if "Call" in w_wtype else "Put Warrant"
+                w_sym_raw = w_sym.strip().upper()
+                if not w_sym_raw.endswith('.TW') and not w_sym_raw.endswith('.TWO'):
+                    w_sym_clean = w_sym_raw + '.TW'
+                else:
+                    w_sym_clean = w_sym_raw
+                w_pl = 0
+                w_cost = 0
+                if w_dir == "Sell":
+                    _, _, w_cost = calculate_fifo_outcome(w_sym_clean, int(w_qty), w_price, str(w_date), w_mode)
+                    w_pl = w_total - w_cost
+                add_transaction(str(w_date), w_sym_clean, w_name.strip(),
+                                w_dir, w_mode, w_price, int(w_qty),
+                                w_fee, w_tax, 0, 0, w_pl, w_cost)
+                st.success(f"已記錄：{w_sym_clean} {w_mode} {w_dir} {int(w_qty)}股 @ {w_price}")
+                time.sleep(1)
+                st.rerun()
+
+        st.markdown("---")
+        st.header("📊 期貨登錄")
+
+        # 讀取現有開倉部位供選單使用
+        futures_positions = get_futures_open_positions(st.session_state.db_updated)
+        open_symbols = [f"{p['symbol']} ({p['direction']}, {p['open_contracts']}口)" for p in futures_positions]
+
+        futures_mode = st.radio("操作模式", ["開倉", "逐日結算", "平倉"], horizontal=True, key="futures_mode")
+
+        if futures_mode == "開倉":
+            with st.form("futures_open_form"):
+                f_date = st.date_input("日期", date.today(), key="f_open_date")
+                f_sym = st.text_input("代號 (如 TX, MTX, 2330F)", key="f_open_sym")
+                f_name = st.text_input("名稱", key="f_open_name")
+                f_dir = st.selectbox("方向", ["Long (多)", "Short (空)"], key="f_open_dir")
+                f_contracts = st.number_input("口數", min_value=1, step=1, key="f_open_contracts")
+                f_price = st.number_input("建倉點位", min_value=0.0, step=1.0, key="f_open_price")
+                f_mult = st.selectbox("每口乘數", [200, 50, 2000], format_func=lambda x: f"{x} ({'台指' if x==200 else '小台' if x==50 else '個股期'})", key="f_open_mult")
+                f_fee = st.number_input("手續費", min_value=0, value=100, step=1, key="f_open_fee")
+                f_margin = st.number_input("初始保證金", min_value=0, step=1000, key="f_open_margin")
+                submitted_open = st.form_submit_button("確認開倉", type="primary")
+                if submitted_open:
+                    direction_val = "Long" if "Long" in f_dir else "Short"
+                    add_futures_open(str(f_date), f_sym.strip().upper(), f_name.strip(),
+                                     direction_val, int(f_contracts), f_price,
+                                     float(f_mult), f_fee, f_margin)
+                    st.success(f"期貨開倉已記錄：{f_sym} {direction_val} {f_contracts}口 @ {f_price}")
+                    time.sleep(1)
+                    st.rerun()
+
+        elif futures_mode == "逐日結算":
+            with st.form("futures_settlement_form"):
+                f_date = st.date_input("日期", date.today(), key="f_settle_date")
+                if open_symbols:
+                    sel = st.selectbox("選擇部位", open_symbols, key="f_settle_sym")
+                    idx = open_symbols.index(sel)
+                    sel_sym = futures_positions[idx]['symbol']
+                    sel_name = futures_positions[idx]['name']
+                else:
+                    st.info("目前無開倉部位")
+                    sel_sym = ""
+                    sel_name = ""
+                f_settle_pl = st.number_input("結算損益 (正=盈餘/負=扣款)", step=100, key="f_settle_pl")
+                submitted_settle = st.form_submit_button("確認結算", type="primary")
+                if submitted_settle and sel_sym:
+                    add_futures_settlement(str(f_date), sel_sym, sel_name, f_settle_pl)
+                    st.success(f"逐日結算已記錄：{sel_sym} ${f_settle_pl:+,}")
+                    time.sleep(1)
+                    st.rerun()
+
+        else:  # 平倉
+            with st.form("futures_close_form"):
+                f_date = st.date_input("日期", date.today(), key="f_close_date")
+                if open_symbols:
+                    sel = st.selectbox("選擇部位", open_symbols, key="f_close_sym")
+                    idx = open_symbols.index(sel)
+                    sel_sym = futures_positions[idx]['symbol']
+                    sel_name = futures_positions[idx]['name']
+                    max_contracts = futures_positions[idx]['open_contracts']
+                else:
+                    st.info("目前無開倉部位")
+                    sel_sym = ""
+                    sel_name = ""
+                    max_contracts = 1
+                f_close_contracts = st.number_input("平倉口數", min_value=1, max_value=max_contracts, step=1, key="f_close_contracts")
+                f_close_price = st.number_input("平倉點位", min_value=0.0, step=1.0, key="f_close_price")
+                f_close_fee = st.number_input("手續費", min_value=0, value=100, step=1, key="f_close_fee")
+                submitted_close = st.form_submit_button("確認平倉", type="primary")
+                if submitted_close and sel_sym:
+                    add_futures_close(str(f_date), sel_sym, sel_name,
+                                      int(f_close_contracts), f_close_price, f_close_fee)
+                    st.success(f"期貨平倉已記錄：{sel_sym} {f_close_contracts}口 @ {f_close_price}")
+                    time.sleep(1)
+                    st.rerun()
 
     # === 右側主畫面 ===
     df = get_transactions(st.session_state.db_updated)
@@ -1209,36 +1532,56 @@ def main():
 
                 hide_index=True
 
-                
-
-            
-
             )
-            st.divider()
-            st.subheader("📈 市場倉位總淨值走勢 (Equity Curve)")
-            
-            with st.spinner("計算市場倉位曲線中..."):
-                equity_df = get_daily_equity_curve(df)
-                
-            if not equity_df.empty:
-                # 畫圖
-                fig_equity = px.area(equity_df, x='date', y='equity', title="每日市場倉位總淨值")
-                fig_equity.update_layout(
-                    xaxis_title="", 
-                    yaxis_title="總淨值 (TWD)", 
-                    hovermode="x unified",
-                    margin=dict(t=30, b=0, l=0, r=0)
-                )
-                fig_equity.update_traces(line_color='#00C853', fillcolor='rgba(0, 200, 83, 0.1)')
-                st.plotly_chart(fig_equity, width='stretch')
-            else:
-                st.info("尚無足夠資料繪製淨值曲線 (需有歷史股價資料)")
 
 
 
         else:
 
             st.info("目前無持股，請新增交易。")
+
+        # === 期貨持倉區塊 ===
+        futures_positions = get_futures_open_positions(st.session_state.db_updated)
+        if futures_positions:
+            st.divider()
+            st.subheader("📊 期貨持倉")
+            futures_rows = []
+            futures_unrealized_total = 0
+            for fp in futures_positions:
+                # 嘗試抓現價 (期貨代號通常無法用 yfinance，顯示 — 即可)
+                curr_price_f = None
+                try:
+                    ticker_sym = fp['symbol'] + '.TW' if not fp['symbol'].endswith('.TW') else fp['symbol']
+                    t = yf.Ticker(ticker_sym)
+                    curr_price_f = t.fast_info.last_price
+                except Exception:
+                    curr_price_f = None
+
+                if curr_price_f and fp['open_price'] > 0:
+                    direction_sign = 1 if fp['direction'] == 'Long' else -1
+                    unrealized = direction_sign * (curr_price_f - fp['open_price']) * fp['multiplier'] * fp['open_contracts']
+                    futures_unrealized_total += unrealized
+                    unrealized_str = f"${unrealized:+,.0f}"
+                else:
+                    unrealized_str = "—"
+
+                futures_rows.append({
+                    '代號': fp['symbol'],
+                    '名稱': fp['name'],
+                    '方向': fp['direction'],
+                    '口數': fp['open_contracts'],
+                    '建倉點': fp['open_price'],
+                    '乘數': int(fp['multiplier']),
+                    '未實現損益': unrealized_str,
+                    '累積結算': f"${fp['acc_settlement']:+,.0f}",
+                    '保證金': f"${fp['margin']:,.0f}"
+                })
+
+            st.dataframe(pd.DataFrame(futures_rows), width='stretch', hide_index=True)
+
+            if futures_unrealized_total != 0:
+                f_pl_color = "normal" if futures_unrealized_total >= 0 else "inverse"
+                st.metric("期貨未實現損益 (合計)", f"${futures_unrealized_total:+,.0f}", delta_color=f_pl_color)
 
     with tab2:
         st.subheader("🏆 獲利績效分析")
@@ -1248,7 +1591,21 @@ def main():
         closed_trades = df[df['realized_pl'] != 0].copy()
         
         if closed_trades.empty:
-            st.info("尚未有賣出獲利紀錄。")
+            st.info("尚未有股票賣出獲利紀錄。")
+            # 只有期貨時仍顯示期貨損益
+            futures_closed_only = get_futures_closed_trades(st.session_state.db_updated)
+            if not futures_closed_only.empty:
+                st.subheader("📊 期貨已實現損益")
+                futures_total_pl_only = futures_closed_only['realized_pl'].sum()
+                f_c = "normal" if futures_total_pl_only >= 0 else "inverse"
+                st.metric("期貨總已實現損益", f"${futures_total_pl_only:+,.0f}", delta_color=f_c)
+                fut_disp = futures_closed_only[['date', 'symbol', 'name', 'direction', 'contracts', 'price', 'realized_pl']].copy()
+                fut_disp.columns = ['日期', '代號', '名稱', '方向', '口數', '平倉點', '已實現損益']
+                def _c_f(v):
+                    c = '#FF5252' if v > 0 else '#00C853' if v < 0 else 'white'
+                    return f'color: {c}; font-weight: bold;'
+                st.dataframe(fut_disp.style.format({'平倉點': '{:.0f}', '已實現損益': '{:+,.0f}'}).map(_c_f, subset=['已實現損益']),
+                             width='stretch', hide_index=True)
         else:
             # 確保有 date_obj 欄位供篩選
             if 'date_obj' not in closed_trades.columns:
@@ -1327,6 +1684,40 @@ def main():
                     .bar(subset=['損益'], align='mid', color=['#00C853', '#FF5252']),
                     width='stretch', hide_index=True
                 )
+
+            # === 期貨已實現損益區塊 ===
+            futures_closed = get_futures_closed_trades(st.session_state.db_updated)
+            if not futures_closed.empty:
+                st.markdown("---")
+                st.subheader("📊 期貨已實現損益")
+
+                # 篩選日期區間
+                futures_closed['date_obj'] = pd.to_datetime(futures_closed['date']).dt.date
+                fut_in_range = futures_closed
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_d, end_d = date_range
+                    fut_in_range = futures_closed[
+                        (futures_closed['date_obj'] >= start_d) &
+                        (futures_closed['date_obj'] <= end_d)
+                    ]
+
+                if not fut_in_range.empty:
+                    futures_total_pl = fut_in_range['realized_pl'].sum()
+                    f_color = "normal" if futures_total_pl >= 0 else "inverse"
+                    st.metric("期貨區間已實現損益", f"${futures_total_pl:+,.0f}", delta_color=f_color)
+
+                    fut_display = fut_in_range[['date', 'symbol', 'name', 'direction', 'contracts', 'price', 'realized_pl']].copy()
+                    fut_display.columns = ['日期', '代號', '名稱', '方向', '口數', '平倉點', '已實現損益']
+
+                    def color_fut_pl(val):
+                        color = '#FF5252' if val > 0 else '#00C853' if val < 0 else 'white'
+                        return f'color: {color}; font-weight: bold;'
+
+                    st.dataframe(
+                        fut_display.style.format({'平倉點': '{:.0f}', '已實現損益': '{:+,.0f}'})
+                        .map(color_fut_pl, subset=['已實現損益']),
+                        width='stretch', hide_index=True
+                    )
 
     # --- Tab 3: 交易流水帳 ---
     with tab3:
