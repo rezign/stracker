@@ -1,8 +1,8 @@
 # 📈 個人資產管理系統 (Personal Asset Management System)
 ## Screenshots
 
-![Asset Dashboard](assets/dashboard.png)
-![Performance Analysis](assets/performance.png)
+![Asset Dashboard](asset/dashboard.png)
+![Performance Analysis](asset/performance.png)
 這是一個基於 Python Streamlit 構建的投資組合追蹤工具。專為台股投資人設計，支援**現股、融資、融券、當沖、權證及期貨**等多種交易模式。
 
 本系統不僅能記錄交易，還能自動計算**手續費、證交稅、融資利息**，並採用 **FIFO (先進先出)** 邏輯精準計算已實現損益與勝率。
